@@ -91,6 +91,10 @@ async def process_ticker(session, symbol, price, timestamp_ms):
     prices = history[symbol]
     prices.append((now, price))
 
+    # Monitor prices continuously, but only send volatility alerts from 08:00 to 00:00 Madrid time.
+    if datetime.now(MADRID).hour < 8:
+        return
+
     # Keep enough data for the largest window plus a safety margin.
     max_age = max(WINDOWS_MINUTES) * 60 + 30
     while prices and prices[0][0] < now - max_age:
