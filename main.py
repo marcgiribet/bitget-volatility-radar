@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -174,29 +174,29 @@ async def run_connection(session, symbols):
 
 
 async def daily_status(session, symbols):
-    """Send one daily status at 08:00 Europe/Madrid (DST-aware)."""
-    last_sent_date = None
-    while True:
-        local_now = datetime.now(MADRID)
-        if local_now.hour == 8 and local_now.minute < 2 and last_sent_date != local_now.date():
-            now = time.time()
-            fresh = [s for s in symbols if now - last_received_at.get(s, 0) <= 120]
+    """One status per 08:00 cron run, once ticker data has had time to arrive."""
+    while datetime.now(MADRID).hour == 8:
+        now = time.time()
+        fresh = [s for s in symbols if now - last_received_at.get(s, 0) <= 120]
+        # Wait for actual data, or report a problem after 2 minutes.
+        if fresh or datetime.now(MADRID).minute >= 2:
+            local_now = datetime.now(MADRID)
             stale = [s for s in symbols if s not in fresh]
-            if fresh:
-                status = f"🟢 Recibiendo precios recientes de {len(fresh)}/{len(symbols)} mercados."
-            else:
-                status = "🔴 Sin precios recientes de los mercados monitorizados."
+            status = (
+                f"🟢 Recibiendo precios recientes de {len(fresh)}/{len(symbols)} mercados."
+                if fresh else "🔴 Sin precios recientes de los mercados monitorizados."
+            )
             details = f"\\nSin datos recientes: {', '.join(stale)}" if stale else ""
             message = (
-                f"📊 Estado diario Bitget Radar — {local_now:%d/%m/%Y} 08:00 "
-                "(hora peninsular española)\\n"
+                f"📊 Estado diario Bitget Radar — {local_now:%d/%m/%Y} "
+                "(informe de las 08:00, hora peninsular española)\\n"
                 f"{status}\\n"
                 f"Umbral: ±{ALERT_PERCENT:g}% | Ventanas: {', '.join(map(str, WINDOWS_MINUTES))} min"
                 f"{details}"
             )
             await telegram_send(session, message)
-            last_sent_date = local_now.date()
-        await asyncio.sleep(20)
+            return
+        await asyncio.sleep(10)
 
 
 async def main():
@@ -217,29 +217,37 @@ async def main():
             )
         log.info("Radar iniciado. Símbolos activos (%d): %s", len(symbols), ", ".join(symbols))
         log.info("Umbral: ±%.2f%% | Ventanas: %s minutos", ALERT_PERCENT, WINDOWS_MINUTES)
-        status_task = asyncio.create_task(daily_status(session, symbols))
+        # Railway cron starts a new process each UTC hour. Stop before the next
+        # hourly trigger so the following run can start without overlap.
+        local_now = datetime.now(MADRID)
+        if local_now.hour < 8:
+            log.info("Fuera del horario 08:00-00:00 Madrid: cerrando sin monitorizar.")
+            return
+        next_hour = (datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+                     + timedelta(hours=1))
+        seconds_left = (next_hour - datetime.now(timezone.utc)).total_seconds() - 10
+        if seconds_left <= 0:
+            log.info("Demasiado cerca del siguiente inicio horario: cerrando.")
+            return
+        log.info("Ejecución horaria Railway: %.0f segundos hasta el cierre.", seconds_left)
+        status_task = (asyncio.create_task(daily_status(session, symbols))
+                       if local_now.hour == 8 else None)
         try:
-            while True:
-                # Disconnect completely overnight; no market data is received or processed.
-                local_now = datetime.now(MADRID)
-                if local_now.hour < 8:
-                    log.info("Horario nocturno: finalizando proceso para ahorrar recursos Railway.")
-                    return
-                try:
-                    # Close the WebSocket at midnight even if no tickers arrive.
-                    async with asyncio.timeout((24 - local_now.hour) * 3600 - local_now.minute * 60 - local_now.second):
+            async with asyncio.timeout(seconds_left):
+                while True:
+                    try:
                         await run_connection(session, symbols)
-                except asyncio.CancelledError:
-                    raise
-                except TimeoutError:
-                    log.info("Medianoche: cerrando el radar para ahorrar recursos Railway.")
-                    return
-                except Exception:
-                    log.exception("Conexión interrumpida; reintentando en 5 segundos.")
-                    await asyncio.sleep(5)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("Conexión interrumpida; reintentando en 5 segundos.")
+                        await asyncio.sleep(5)
+        except TimeoutError:
+            log.info("Fin del bloque horario: cerrando para liberar recursos Railway.")
         finally:
-            status_task.cancel()
-            await asyncio.gather(status_task, return_exceptions=True)
+            if status_task:
+                status_task.cancel()
+                await asyncio.gather(status_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
