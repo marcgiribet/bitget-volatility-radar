@@ -223,12 +223,8 @@ async def main():
                 # Disconnect completely overnight; no market data is received or processed.
                 local_now = datetime.now(MADRID)
                 if local_now.hour < 8:
-                    history.clear()
-                    alert_state.clear()
-                    seconds_until_open = (8 - local_now.hour) * 3600 - local_now.minute * 60 - local_now.second
-                    log.info("Radar en pausa nocturna hasta las 08:00 (hora de Madrid).")
-                    await asyncio.sleep(max(1, min(seconds_until_open, 300)))
-                    continue
+                    log.info("Horario nocturno: finalizando proceso para ahorrar recursos Railway.")
+                    return
                 try:
                     # Close the WebSocket at midnight even if no tickers arrive.
                     async with asyncio.timeout((24 - local_now.hour) * 3600 - local_now.minute * 60 - local_now.second):
@@ -236,7 +232,8 @@ async def main():
                 except asyncio.CancelledError:
                     raise
                 except TimeoutError:
-                    log.info("Medianoche: conexión Bitget cerrada hasta las 08:00.")
+                    log.info("Medianoche: cerrando el radar para ahorrar recursos Railway.")
+                    return
                 except Exception:
                     log.exception("Conexión interrumpida; reintentando en 5 segundos.")
                     await asyncio.sleep(5)
