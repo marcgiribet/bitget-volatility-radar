@@ -91,10 +91,6 @@ async def process_ticker(session, symbol, price, timestamp_ms):
     prices = history[symbol]
     prices.append((now, price))
 
-    # Monitor prices continuously, but only send volatility alerts from 08:00 to 00:00 Madrid time.
-    if datetime.now(MADRID).hour < 8:
-        return
-
     # Keep enough data for the largest window plus a safety margin.
     max_age = max(WINDOWS_MINUTES) * 60 + 30
     while prices and prices[0][0] < now - max_age:
@@ -224,10 +220,23 @@ async def main():
         status_task = asyncio.create_task(daily_status(session, symbols))
         try:
             while True:
+                # Disconnect completely overnight; no market data is received or processed.
+                local_now = datetime.now(MADRID)
+                if local_now.hour < 8:
+                    history.clear()
+                    alert_state.clear()
+                    seconds_until_open = (8 - local_now.hour) * 3600 - local_now.minute * 60 - local_now.second
+                    log.info("Radar en pausa nocturna hasta las 08:00 (hora de Madrid).")
+                    await asyncio.sleep(max(1, min(seconds_until_open, 300)))
+                    continue
                 try:
-                    await run_connection(session, symbols)
+                    # Close the WebSocket at midnight even if no tickers arrive.
+                    async with asyncio.timeout((24 - local_now.hour) * 3600 - local_now.minute * 60 - local_now.second):
+                        await run_connection(session, symbols)
                 except asyncio.CancelledError:
                     raise
+                except TimeoutError:
+                    log.info("Medianoche: conexión Bitget cerrada hasta las 08:00.")
                 except Exception:
                     log.exception("Conexión interrumpida; reintentando en 5 segundos.")
                     await asyncio.sleep(5)
