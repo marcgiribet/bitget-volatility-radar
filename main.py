@@ -5,6 +5,7 @@ import os
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import websockets
@@ -34,6 +35,8 @@ log = logging.getLogger("volatility-radar")
 # Per-symbol rolling price history and per-window/direction alert state.
 history = defaultdict(deque)
 alert_state = {}
+last_received_at = {}
+MADRID = ZoneInfo("Europe/Madrid")
 
 
 def requested_symbols():
@@ -84,6 +87,7 @@ def calculate_change(prices, now, window_seconds):
 
 async def process_ticker(session, symbol, price, timestamp_ms):
     now = timestamp_ms / 1000.0 if timestamp_ms else time.time()
+    last_received_at[symbol] = time.time()
     prices = history[symbol]
     prices.append((now, price))
 
@@ -166,6 +170,32 @@ async def run_connection(session, symbols):
             await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
+async def daily_status(session, symbols):
+    """Send one daily status at 08:00 Europe/Madrid (DST-aware)."""
+    last_sent_date = None
+    while True:
+        local_now = datetime.now(MADRID)
+        if local_now.hour == 8 and local_now.minute < 2 and last_sent_date != local_now.date():
+            now = time.time()
+            fresh = [s for s in symbols if now - last_received_at.get(s, 0) <= 120]
+            stale = [s for s in symbols if s not in fresh]
+            if fresh:
+                status = f"🟢 Recibiendo precios recientes de {len(fresh)}/{len(symbols)} mercados."
+            else:
+                status = "🔴 Sin precios recientes de los mercados monitorizados."
+            details = f"\\nSin datos recientes: {', '.join(stale)}" if stale else ""
+            message = (
+                f"📊 Estado diario Bitget Radar — {local_now:%d/%m/%Y} 08:00 "
+                "(hora peninsular española)\\n"
+                f"{status}\\n"
+                f"Umbral: ±{ALERT_PERCENT:g}% | Ventanas: {', '.join(map(str, WINDOWS_MINUTES))} min"
+                f"{details}"
+            )
+            await telegram_send(session, message)
+            last_sent_date = local_now.date()
+        await asyncio.sleep(20)
+
+
 async def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID. El radar arrancará, pero no enviará avisos.")
@@ -184,21 +214,19 @@ async def main():
             )
         log.info("Radar iniciado. Símbolos activos (%d): %s", len(symbols), ", ".join(symbols))
         log.info("Umbral: ±%.2f%% | Ventanas: %s minutos", ALERT_PERCENT, WINDOWS_MINUTES)
-        await telegram_send(
-            session,
-            "✅ Bitget Volatility Radar iniciado desde Railway. "
-            f"Monitorizando {len(symbols)} mercados. "
-            f"Umbral: ±{ALERT_PERCENT:g}%. "
-            f"Ventanas: {', '.join(map(str, WINDOWS_MINUTES))} minutos."
-        )
-        while True:
-            try:
-                await run_connection(session, symbols)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Conexión interrumpida; reintentando en 5 segundos.")
-                await asyncio.sleep(5)
+        status_task = asyncio.create_task(daily_status(session, symbols))
+        try:
+            while True:
+                try:
+                    await run_connection(session, symbols)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Conexión interrumpida; reintentando en 5 segundos.")
+                    await asyncio.sleep(5)
+        finally:
+            status_task.cancel()
+            await asyncio.gather(status_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
