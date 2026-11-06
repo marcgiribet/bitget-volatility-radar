@@ -14,7 +14,7 @@ import websockets
 WS_URL = "wss://ws.bitget.com/v2/ws/public"
 REST_URL = "https://api.bitget.com"
 PRODUCT_TYPE = os.getenv("BITGET_PRODUCT_TYPE", "USDT-FUTURES")
-WINDOWS_MINUTES = [int(x.strip()) for x in os.getenv("WINDOWS_MINUTES", "5,10").split(",") if x.strip()]
+WINDOWS_MINUTES = sorted(set(int(x.strip()) for x in os.getenv("WINDOWS_MINUTES", "5,10,15,20").split(",") if x.strip()))
 ALERT_PERCENT = float(os.getenv("ALERT_PERCENT", "1"))
 COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
 SYMBOLS_RAW = os.getenv(
@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("volatility-radar")
 
-# Per-symbol rolling price history and per-window/direction alert state.
+# Per-symbol rolling price history and per-direction alert priority state.
 history = defaultdict(deque)
 alert_state = {}
 last_received_at = {}
@@ -102,12 +102,14 @@ async def process_ticker(session, symbol, price, timestamp_ms):
             continue
 
         direction = "SUBIDA" if change > 0 else "CAÍDA"
-        key = (symbol, minutes, direction)
-        last_sent = alert_state.get(key, 0)
-        if now - last_sent < COOLDOWN_SECONDS:
+        key = (symbol, direction)
+        previous = alert_state.get(key)
+        # A shorter-window alert suppresses the same move on longer windows.
+        # During cooldown, only a NEW, shorter-window alert may supersede it.
+        if previous and now - previous[0] < COOLDOWN_SECONDS and minutes >= previous[1]:
             continue
 
-        alert_state[key] = now
+        alert_state[key] = (now, minutes)
         emoji = "🟢" if change > 0 else "🔴"
         when = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M:%S UTC")
         message = (
@@ -120,6 +122,7 @@ async def process_ticker(session, symbol, price, timestamp_ms):
         )
         log.info("%s %s %+.2f%% en %sm", symbol, direction, change, minutes)
         await telegram_send(session, message)
+        break  # At most one alert per ticker update, prioritizing the shortest window.
 
 
 async def run_connection(session, symbols):
