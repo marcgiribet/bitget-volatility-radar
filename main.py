@@ -184,6 +184,13 @@ async def main():
             )
         log.info("Radar iniciado. Símbolos activos (%d): %s", len(symbols), ", ".join(symbols))
         log.info("Umbral: ±%.2f%% | Ventanas: %s minutos", ALERT_PERCENT, WINDOWS_MINUTES)
+        await telegram_send(
+            session,
+            "✅ Bitget Volatility Radar iniciado desde Railway. "
+            f"Monitorizando {len(symbols)} mercados. "
+            f"Umbral: ±{ALERT_PERCENT:g}%. "
+            f"Ventanas: {', '.join(map(str, WINDOWS_MINUTES))} minutos."
+        )
         while True:
             try:
                 await run_connection(session, symbols)
